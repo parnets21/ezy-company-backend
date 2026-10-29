@@ -1,0 +1,107 @@
+const Company = require('../models/Company Management/Company')
+
+async function loadCompany(req) {
+  if (req.company) return req.company
+  if (!req.user?.company_id) return null
+  req.company = await Company.findById(req.user.company_id).lean()
+  return req.company
+}
+
+async function requireRetailerIdentity(req, res, next) {
+  const company = await loadCompany(req)
+  // Allow both the Retailer owner and RetailerStaff (who have a synthetic role)
+  const isRetailerRole = req.user?.role === 'Retailer' || req.user?.role === 'RetailerStaff'
+  if (!company || !isRetailerRole || company.biz_type !== 'Retailer') {
+    return res.status(403).json({ success: false, message: 'Retailer account required.' })
+  }
+  if (company.is_active === false) {
+    return res.status(403).json({ success: false, message: 'Company account is inactive.' })
+  }
+  next()
+}
+
+async function requireApprovedRetailer(req, res, next) {
+  const company = await loadCompany(req)
+  const isRetailerRole = req.user?.role === 'Retailer' || req.user?.role === 'RetailerStaff'
+  if (!company || !isRetailerRole || company.biz_type !== 'Retailer') {
+    return res.status(403).json({ success: false, message: 'Retailer account required.' })
+  }
+  if (company.is_active === false) {
+    return res.status(403).json({ success: false, message: 'Company account is inactive.' })
+  }
+  if (company.status !== 'Approved') {
+    return res.status(403).json({
+      success: false,
+      message: 'Company approval is required for marketplace access.',
+      data: { company_status: company.status },
+    })
+  }
+  next()
+}
+
+async function denyRetailerErpAccess(req, res, next) {
+  // Super Admin has platform-wide access — never block them
+  if (req.user?.role === 'Super Admin') return next()
+
+  // The ERP web app (company-login) must work for EVERY company, whether its
+  // biz_type is Wholesaler or Retailer. The wholesaler/retailer distinction is
+  // only meaningful in the mobile apps, which use dedicated tokens:
+  //   - retailer mobile app : token { app: 'retailer' }
+  //   - retailer staff app  : token { app: 'retailer_staff' } → role RetailerStaff
+  // Only those mobile-app tokens are redirected to the retailer API. A web
+  // company-login token (no `app` flag) is always allowed, so we do NOT block
+  // based on the company's biz_type anymore.
+  const isRetailerAppToken =
+    req.tokenApp === 'retailer' ||
+    req.tokenApp === 'retailer_staff' ||
+    req.user?.role === 'RetailerStaff'
+
+  if (isRetailerAppToken) {
+    return res.status(403).json({ success: false, message: 'Use the retailer API for this account.' })
+  }
+  next()
+}
+
+async function requireApprovedSeller(req, res, next) {
+  const allowedRoles = ['Wholesaler', 'Company Owner', 'Manager', 'Sales Executive', 'Super Admin']
+  if (!allowedRoles.includes(req.user?.role)) {
+    return res.status(403).json({ success: false, message: 'Seller access required.' })
+  }
+  const company = await loadCompany(req)
+  if (!company || company.biz_type === 'Retailer' || company.status !== 'Approved' || company.is_active === false) {
+    return res.status(403).json({ success: false, message: 'An approved, active seller company is required.' })
+  }
+  next()
+}
+
+/**
+ * Gate a retailer route behind one of the RetailerApp module keys.
+ *
+ * The retailer owner always passes — only staff are restricted. A staff record
+ * with an empty `staff_app_access` array is treated as unrestricted (backward
+ * compatibility: the backend treats `[]` as "everything").
+ *
+ * Lives here rather than inside retailerRoutes.js so the ERP route surface
+ * (routes/Retailer Management/retailerErpRoutes.js) can share it.
+ */
+function requireRetailerModule(moduleKey) {
+  return (req, res, next) => {
+    if (req.user?.role !== 'RetailerStaff') return next()
+    const access = req.retailerStaff?.staff_app_access || []
+    if (access.length === 0) return next()
+    if (access.includes(moduleKey)) return next()
+    return res.status(403).json({
+      success: false,
+      message: `Access denied. You do not have access to the ${moduleKey} module.`,
+      module: moduleKey,
+    })
+  }
+}
+
+module.exports = {
+  requireRetailerIdentity,
+  requireApprovedRetailer,
+  denyRetailerErpAccess,
+  requireApprovedSeller,
+  requireRetailerModule,
+}

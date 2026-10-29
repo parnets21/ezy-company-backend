@@ -1,0 +1,573 @@
+const { sendSuccess, sendError, paginate } = require('../../utils/helpers')
+const path         = require('path')
+const fs           = require('fs')
+const Company      = require('../../models/Company Management/Company')
+const User         = require('../../models/User Management/User')
+const Product      = require('../../models/Product Management/Product')
+const Notification = require('../../models/System Management/Notification')
+const { notifyRetailer } = require('../../utils/pushHelper')
+const { getNextCompanyCode } = require('../../utils/sequence')
+
+/** Ensure the existing web login account remains a Company Owner. */
+async function ensureCompanyOwner(company) {
+  const existing = await User.findOne({ company_id: company._id, role: 'Company Owner' }).lean()
+  if (existing) return existing
+
+  const mobile = String(company.mobile || '').trim()
+  if (!/^\d{10}$/.test(mobile)) return null  // no valid mobile to log in with
+
+  // Email is unique+required on User. Use the company email if free, else a placeholder.
+  let email = String(company.email || '').toLowerCase().trim()
+  if (!email || await User.findOne({ email }).lean()) {
+    const base = (company.company_code || company.name || 'company')
+      .toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 24) || 'company'
+    email = `owner.${base}@placeholder.ezyenquiry.local`
+    let n = 1
+    while (await User.findOne({ email }).lean()) {
+      email = `owner.${base}${n}@placeholder.ezyenquiry.local`
+      n++
+    }
+  }
+
+  try {
+    return await User.create({
+      company_id: company._id,
+      name:       (company.owner_name || '').trim() || `${company.name} Owner`,
+      email,
+      mobile,
+      role:       'Company Owner',
+      is_active:  true,
+    })
+  } catch (_) {
+    return null  // non-fatal; don't block approval
+  }
+}
+
+/** The retailer mobile app requires a Retailer role; keep it separate from web access. */
+async function ensureRetailerMobileUser(company) {
+  if (!/^retail/i.test(String(company.biz_type || ''))) return null
+  const existing = await User.findOne({ company_id: company._id, role: 'Retailer' }).lean()
+  if (existing) {
+    if (!existing.is_active) await User.updateOne({ _id: existing._id }, { is_active: true })
+    return existing
+  }
+
+  const mobile = String(company.mobile || '').trim()
+  if (!/^\d{10}$/.test(mobile)) return null
+  const base = String(company.company_code || company._id || 'company')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 24) || 'company'
+  let email = `retailer.${base}@placeholder.ezyenquiry.local`
+  let n = 1
+  while (await User.findOne({ email }).lean()) email = `retailer.${base}${n++}@placeholder.ezyenquiry.local`
+
+  try {
+    return await User.create({
+      company_id: company._id,
+      name: (company.owner_name || '').trim() || `${company.name} Owner`,
+      email,
+      mobile,
+      role: 'Retailer',
+      is_active: true,
+    })
+  } catch (_) {
+    return null
+  }
+}
+
+/** GET /api/companies */
+async function listCompanies(req, res) {
+  const { status, plan, page = 1, limit = 20 } = req.query
+  const offset = (parseInt(page) - 1) * parseInt(limit)
+
+  const query = {}
+  if (status && status !== 'All') query.status            = status
+  if (plan   && plan   !== 'All') query.subscription_plan = plan
+
+  if (req.user?.role === 'Super Admin') {
+    // Admin console: show all customer companies except the internal admin
+    // company and any companies registered via the company-web portal.
+    query.company_code  = { $ne: 'ADMIN-001' }
+    query.registered_via = { $ne: 'company_web' }
+  } else {
+    // Company-web user: show their own company and registrations submitted
+    // from that company's account. Do not expose registrations from other tenants.
+    if (!req.user?.company_id) {
+      return sendSuccess(res, { companies: [], pagination: paginate(0, parseInt(page), parseInt(limit)) })
+    }
+    query.$or = [
+      { _id: req.user.company_id },
+      { registered_by_company_id: req.user.company_id, registered_via: 'company_web' },
+    ]
+  }
+
+  const [total, companies] = await Promise.all([
+    Company.countDocuments(query),
+    Company.find(query)
+      .populate('reviewed_by', 'name')
+      .sort({ created_at: -1 })
+      .skip(offset)
+      .limit(parseInt(limit))
+      .lean(),
+  ])
+
+  // Attach owner user info to each company
+  const companyIds = companies.map(c => c._id)
+  const owners = await User.find({
+    company_id: { $in: companyIds },
+    role: 'Company Owner',
+  }).select('company_id name mobile email').lean()
+
+  const ownerMap = {}
+  owners.forEach(o => { ownerMap[o.company_id.toString()] = o })
+
+  const enriched = companies.map(c => ({
+    ...c,
+    owner_user: ownerMap[c._id.toString()] || null,
+  }))
+
+  sendSuccess(res, { companies: enriched, pagination: paginate(total, parseInt(page), parseInt(limit)) })
+}
+
+/** GET /api/companies/:id */
+async function getCompany(req, res) {
+  const company = await Company.findById(req.params.id).lean()
+  if (!company) return sendError(res, 'Company not found.', 404)
+  sendSuccess(res, company)
+}
+
+/** POST /api/companies */
+async function createCompany(req, res) {
+  const { name, owner_name, biz_type, mobile, email, gst_number, pan_number, address, city, state, pin_code, subscription_plan } = req.body
+  if (!req.user?.company_id || req.user.role === 'Super Admin') {
+    return sendError(res, 'A company account is required to register here.', 403)
+  }
+  if (!name || !owner_name || !mobile || !email || !pan_number)
+    return sendError(res, 'Name, owner, mobile, email and PAN are required.')
+
+  const company_code = await getNextCompanyCode()
+  const company = await Company.create({
+    company_code, name,
+    owner_name:        owner_name        || '',
+    biz_type:          biz_type          || 'Wholesaler',
+    mobile,
+    email,
+    gst_number:        gst_number        || '',
+    pan_number,
+    address:           address           || '',
+    city:              city              || '',
+    state:             state             || '',
+    pin_code:          pin_code          || '',
+    subscription_plan: subscription_plan || 'Free',
+    // Company-web registration is DIRECT: no admin approval, no OTP. The
+    // company is activated immediately and shows up in the list right away.
+    status:            'Approved',
+    is_active:         true,
+    approved_at:       new Date(),
+    registered_via:    'company_web',   // registered from company-login web app
+    registered_by_company_id: req.user.company_id,
+  })
+
+  // Create the Company Owner user so this company can log in to the web app.
+  await ensureCompanyOwner(company.toObject ? company.toObject() : company)
+  await ensureRetailerMobileUser(company.toObject ? company.toObject() : company)
+
+  sendSuccess(res, company, 'Company registered and activated.', 201)
+}
+
+/** POST /api/companies/:id/documents — store registration KYC files. */
+async function uploadCompanyDocuments(req, res) {
+  const company = await Company.findById(req.params.id)
+  if (!company) return sendError(res, 'Company not found.', 404)
+  if (req.user?.role !== 'Super Admin' && String(req.user?.company_id) !== String(company._id)) {
+    return sendError(res, 'You cannot upload documents for another company.', 403)
+  }
+
+  const fileMap = req.files || {}
+  const fields = {
+    gst: { url: 'doc_gst_url', flag: 'docs_gst', type: 'gst' },
+    pan: { url: 'doc_pan_url', flag: 'docs_pan', type: 'pan' },
+    address: { url: 'doc_reg_url', flag: 'docs_address', type: 'registration' },
+    biz: { url: 'doc_trade_url', flag: 'docs_biz', type: 'trade' },
+  }
+  let uploaded = 0
+  for (const [field, config] of Object.entries(fields)) {
+    const file = fileMap[field]?.[0]
+    if (!file) continue
+    const fileUrl = `/uploads/kyc/${file.filename}`
+    company[config.url] = fileUrl
+    company[config.flag] = true
+    const document = {
+      document_type: config.type,
+      file_url: fileUrl,
+      status: 'Pending',
+      reject_reason: '',
+      uploaded_at: new Date(),
+      reviewed_at: null,
+    }
+    const existingIndex = company.kyc_documents.findIndex(item => item.document_type === config.type)
+    if (existingIndex >= 0) company.kyc_documents[existingIndex] = document
+    else company.kyc_documents.push(document)
+    uploaded++
+  }
+  if (!uploaded) return sendError(res, 'Select at least one document to upload.', 400)
+
+  await company.save()
+  sendSuccess(res, { uploaded, company_id: company._id }, 'Documents uploaded successfully.')
+}
+
+
+/** PUT /api/companies/:id */
+async function updateCompany(req, res) {
+  const { name, owner_name, biz_type, mobile, email, gst_number, pan_number, address, city, state, pin_code, subscription_plan } = req.body
+  const update = {}
+  if (name              !== undefined) update.name              = name
+  if (owner_name        !== undefined) update.owner_name        = owner_name
+  if (biz_type          !== undefined) update.biz_type          = biz_type
+  if (mobile            !== undefined) update.mobile            = mobile
+  if (email             !== undefined) update.email             = email
+  if (gst_number        !== undefined) update.gst_number        = gst_number
+  if (pan_number        !== undefined) update.pan_number        = pan_number
+  if (address           !== undefined) update.address           = address
+  if (city              !== undefined) update.city              = city
+  if (state             !== undefined) update.state             = state
+  if (pin_code          !== undefined) update.pin_code          = pin_code
+  if (subscription_plan !== undefined) update.subscription_plan = subscription_plan
+
+  const company = await Company.findByIdAndUpdate(req.params.id, update, { new: true }).lean()
+  if (!company) return sendError(res, 'Company not found.', 404)
+  sendSuccess(res, company, 'Company updated.')
+}
+
+/** PATCH /api/companies/:id/approve */
+async function approveCompany(req, res) {
+  const company = await Company.findByIdAndUpdate(
+    req.params.id,
+    { status: 'Approved', reviewed_by: req.user._id },
+    { new: true }
+  )
+  if (!company) return sendError(res, 'Company not found.', 404)
+
+  company.status = 'Approved'
+  company.reject_reason = ''
+  company.reviewed_by = req.user._id
+  const reviewedAt = new Date()
+  for (const document of company.kyc_documents || []) {
+    document.status = 'Approved'
+    document.reject_reason = ''
+    document.reviewed_at = reviewedAt
+  }
+  await company.save()
+
+  // Ensure all users of this company are active
+  await User.updateMany({ company_id: company._id }, { is_active: true })
+
+  // Guarantee a Company Owner exists so this company can log in to the web app.
+  await ensureCompanyOwner(company)
+  await ensureRetailerMobileUser(company)
+
+  // Find the company owner to send notification
+  const owner = await User.findOne({ company_id: company._id, role: { $in: ['Company Owner', 'Retailer'] } }).lean()
+
+  if (owner) {
+    const ownerName = owner.name || company.owner_name || 'Wholesaler'
+
+    // Create in-app notification for the company owner
+    await Notification.create({
+      company_id:   company._id,
+      user_id:      owner._id,
+      type:         'approval',
+      title:        'Registration Approved',
+      message:      `Congratulations ${ownerName}! Your wholesaler registration has been approved successfully.`,
+      reference_id: company._id,
+      is_read:      false,
+    }).catch(() => {})  // non-fatal
+
+    // Send push notification to retailer
+    notifyRetailer(owner._id, {
+      title: 'Account Approved!',
+      body: `Your company "${company.name}" has been approved. You can now access all features.`,
+      type: 'approval',
+      referenceId: company._id,
+    })
+  }
+
+  sendSuccess(res, company, 'Company approved successfully.')
+}
+
+/** PATCH /api/companies/:id/reject */
+async function rejectCompany(req, res) {
+  const { reject_reason } = req.body
+  const reason = String(reject_reason || '').trim()
+  const company = await Company.findById(req.params.id)
+  if (!company) return sendError(res, 'Company not found.', 404)
+
+  company.status = 'Rejected'
+  company.reject_reason = reason
+  company.reviewed_by = req.user._id
+  const reviewedAt = new Date()
+  for (const document of company.kyc_documents || []) {
+    document.status = 'Rejected'
+    document.reject_reason = reason
+    document.reviewed_at = reviewedAt
+  }
+  await company.save()
+
+  // Find owner and notify about rejection
+  const owner = await User.findOne({ company_id: company._id, role: { $in: ['Company Owner', 'Retailer'] } }).lean()
+  if (owner) {
+    await Notification.create({
+      company_id:   company._id,
+      user_id:      owner._id,
+      type:         'rejection',
+      title:        '❌ Application Rejected',
+      message:      `Your company registration has been rejected. Reason: ${reason || 'Not specified'}. Please contact support for more information.`,
+      reference_id: company._id,
+      is_read:      false,
+    }).catch(() => {})
+
+    // Send push notification to retailer
+    notifyRetailer(owner._id, {
+      title: 'Application Rejected',
+      body: `Your registration was rejected. Reason: ${reason || 'Not specified'}.`,
+      type: 'rejection',
+      referenceId: company._id,
+    })
+  }
+
+  sendSuccess(res, company, 'Company rejected.')
+}
+
+/** PATCH /api/companies/:id/request-resubmit  (Super Admin)
+ *  Ask the wholesaler to re-upload documents. Company goes back to 'Pending',
+ *  flagged docs are reset so the app re-opens the upload step.
+ *  body: { reason, docs?: ['gst','pan','trade','registration'] }
+ */
+async function requestResubmission(req, res) {
+  const reason = String(req.body?.reason || '').trim()
+  const docs = Array.isArray(req.body?.docs) ? req.body.docs : []   // which docs to redo; empty = all
+  const company = await Company.findById(req.params.id)
+  if (!company) return sendError(res, 'Company not found.', 404)
+
+  company.status        = 'Pending'
+  company.reject_reason = reason
+  company.reviewed_by   = req.user._id
+
+  // Reset the flagged docs (or all if none specified) so the app asks to re-upload.
+  const map = { gst: 'docs_gst', pan: 'docs_pan', trade: 'docs_biz', registration: 'docs_address' }
+  const targets = docs.length ? docs : ['gst', 'pan', 'trade', 'registration']
+  for (const d of targets) {
+    if (map[d]) company[map[d]] = false
+  }
+  for (const document of company.kyc_documents || []) {
+    if (!docs.length || docs.includes(document.document_type)) {
+      document.status = 'Rejected'
+      document.reject_reason = reason
+      document.reviewed_at = new Date()
+    }
+  }
+  await company.save()
+
+  const owner = await User.findOne({ company_id: company._id, role: { $in: ['Company Owner', 'Retailer'] } }).lean()
+  if (owner) {
+    await Notification.create({
+      company_id:   company._id,
+      user_id:      owner._id,
+      type:         'resubmission',
+      title:        'Document Resubmission Required',
+      message:      `Please re-upload your documents.${reason ? ` Reason: ${reason}.` : ''}`,
+      reference_id: company._id,
+      is_read:      false,
+    }).catch(() => {})
+    notifyRetailer(owner._id, {
+      title: 'Resubmission Required',
+      body:  `Please re-upload your documents.${reason ? ` Reason: ${reason}` : ''}`,
+      type:  'resubmission',
+      referenceId: company._id,
+    })
+  }
+
+  sendSuccess(res, company.toObject(), 'Resubmission requested.')
+}
+
+/** PATCH /api/companies/:id/suspend  (Super Admin) — blocks app access in real time */
+async function suspendCompany(req, res) {
+  const reason = String(req.body?.reason || '').trim()
+  const company = await Company.findById(req.params.id)
+  if (!company) return sendError(res, 'Company not found.', 404)
+  if (company.status === 'Suspended') return sendError(res, 'Company is already suspended.', 400)
+
+  company.prev_status    = company.status   // remember where to return on reactivate
+  company.status         = 'Suspended'
+  company.is_active      = false
+  company.suspend_reason = reason
+  company.reviewed_by    = req.user._id
+  await company.save()
+
+  // NOTE: we intentionally keep the users' is_active=true so the app can still
+  // call /approval-status and show a proper "Suspended" screen. Data routes are
+  // blocked by requireActiveCompany middleware (real-time company status check).
+
+  // Notify the owner.
+  const owner = await User.findOne({ company_id: company._id, role: { $in: ['Company Owner', 'Retailer'] } }).lean()
+  if (owner) {
+    await Notification.create({
+      company_id:   company._id,
+      user_id:      owner._id,
+      type:         'suspension',
+      title:        'Account Suspended',
+      message:      `Your account has been suspended.${reason ? ` Reason: ${reason}.` : ''} Please contact support.`,
+      reference_id: company._id,
+      is_read:      false,
+    }).catch(() => {})
+    notifyRetailer(owner._id, {
+      title: 'Account Suspended',
+      body:  `Your account has been suspended.${reason ? ` Reason: ${reason}` : ''}`,
+      type:  'suspension',
+      referenceId: company._id,
+    })
+  }
+
+  sendSuccess(res, company.toObject(), 'Company suspended.')
+}
+
+/** PATCH /api/companies/:id/reactivate  (Super Admin) — restores access */
+async function reactivateCompany(req, res) {
+  const company = await Company.findById(req.params.id)
+  if (!company) return sendError(res, 'Company not found.', 404)
+  if (company.status !== 'Suspended') return sendError(res, 'Company is not suspended.', 400)
+
+  company.status         = company.prev_status || 'Approved'
+  company.is_active      = true
+  company.suspend_reason = ''
+  company.prev_status    = ''
+  company.reviewed_by    = req.user._id
+  await company.save()
+
+  const owner = await User.findOne({ company_id: company._id, role: { $in: ['Company Owner', 'Retailer'] } }).lean()
+  if (owner) {
+    await Notification.create({
+      company_id:   company._id,
+      user_id:      owner._id,
+      type:         'reactivation',
+      title:        'Account Reactivated',
+      message:      'Your account has been reactivated. You can now access the app again.',
+      reference_id: company._id,
+      is_read:      false,
+    }).catch(() => {})
+    notifyRetailer(owner._id, {
+      title: 'Account Reactivated',
+      body:  'Your account is active again. Welcome back!',
+      type:  'reactivation',
+      referenceId: company._id,
+    })
+  }
+
+  sendSuccess(res, company.toObject(), 'Company reactivated.')
+}
+
+/** PATCH /api/companies/:id/docs */
+async function updateDocs(req, res) {
+  const { docs_gst, docs_pan, docs_address, docs_biz } = req.body
+  const company = await Company.findById(req.params.id)
+  if (!company) return sendError(res, 'Company not found.', 404)
+
+  company.docs_gst = !!docs_gst
+  company.docs_pan = !!docs_pan
+  company.docs_address = !!docs_address
+  company.docs_biz = !!docs_biz
+
+  const approvals = {
+    gst: company.docs_gst,
+    pan: company.docs_pan,
+    registration: company.docs_address,
+    trade: company.docs_biz,
+  }
+  for (const document of company.kyc_documents || []) {
+    document.status = approvals[document.document_type] ? 'Approved' : 'Pending'
+    document.reject_reason = ''
+    document.reviewed_at = approvals[document.document_type] ? new Date() : null
+  }
+
+  await company.save()
+  sendSuccess(res, company.toObject(), 'Documents updated.')
+}
+
+/** DELETE /api/companies/:id */
+async function deleteCompany(req, res) {
+  const company = await Company.findById(req.params.id).lean()
+  if (!company) return sendError(res, 'Company not found.', 404)
+
+  // A company account may delete only portal registrations created from that
+  // same account. The account's own company and other tenants remain protected.
+  if (req.user?.role !== 'Super Admin' && (
+    company.registered_via !== 'company_web' ||
+    String(company.registered_by_company_id || '') !== String(req.user?.company_id || '')
+  )) {
+    return sendError(res, 'You can delete only registrations created from your company account.', 403)
+  }
+
+  const linkedProductCount = await Product.countDocuments({ company_id: company._id })
+  if (linkedProductCount > 0) {
+    return sendError(
+      res,
+      `Cannot delete this company because it owns ${linkedProductCount} product${linkedProductCount === 1 ? '' : 's'}. Delete or reassign those products first.`,
+      409
+    )
+  }
+
+  // Delete all users associated with this company
+  await User.deleteMany({ company_id: company._id })
+  // Delete the company
+  await Company.deleteOne({ _id: company._id })
+
+  sendSuccess(res, null, 'Company and associated users deleted.')
+}
+
+/**
+ * GET /api/companies/:id/documents/:type
+ * Streams a company's KYC document (gst | pan | address | biz) inline.
+ * Auth is enforced by the route mount (authenticate). KYC files are not
+ * publicly served (see server.js), so this is the sanctioned access path.
+ */
+const DOC_FIELD_BY_TYPE = {
+  gst:     'doc_gst_url',
+  pan:     'doc_pan_url',
+  address: 'doc_reg_url',   // "Address Proof" maps to registration doc
+  biz:     'doc_trade_url', // "Business Registration" maps to trade license
+}
+
+const MIME_BY_EXT = {
+  '.pdf':  'application/pdf',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.webp': 'image/webp',
+}
+
+async function getCompanyDocument(req, res) {
+  const { id, type } = req.params
+  const field = DOC_FIELD_BY_TYPE[type]
+  if (!field) return sendError(res, 'Invalid document type.', 400)
+
+  const company = await Company.findById(id).select(Object.values(DOC_FIELD_BY_TYPE).join(' ')).lean()
+  if (!company) return sendError(res, 'Company not found.', 404)
+
+  const relUrl = company[field]
+  if (!relUrl) return sendError(res, 'Document not uploaded.', 404)
+
+  // Resolve to the file on disk. Stored as "/uploads/kyc/<file>".
+  // Guard against path traversal by resolving and confirming it stays in /uploads.
+  const uploadsRoot = path.resolve(__dirname, '../../../uploads')
+  const absPath     = path.resolve(__dirname, '../../..', '.' + relUrl)
+  if (!absPath.startsWith(uploadsRoot)) return sendError(res, 'Invalid document path.', 400)
+  if (!fs.existsSync(absPath))          return sendError(res, 'File not found on server.', 404)
+
+  const ext  = path.extname(absPath).toLowerCase()
+  const mime = MIME_BY_EXT[ext] || 'application/octet-stream'
+  res.setHeader('Content-Type', mime)
+  res.setHeader('Content-Disposition', `inline; filename="${type}${ext}"`)
+  fs.createReadStream(absPath).pipe(res)
+}
+
+module.exports = { listCompanies, getCompany, createCompany, uploadCompanyDocuments, updateCompany, approveCompany, rejectCompany, requestResubmission, suspendCompany, reactivateCompany, updateDocs, deleteCompany, getCompanyDocument }

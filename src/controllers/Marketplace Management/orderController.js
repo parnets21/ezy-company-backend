@@ -1,0 +1,1147 @@
+const { sendSuccess, sendError, paginate } = require('../../utils/helpers');
+const Order        = require('../../models/Marketplace Management/Order');
+const Enquiry      = require('../../models/Marketplace Management/Enquiry');
+const Notification = require('../../models/System Management/Notification');
+const Invoice      = require('../../models/Finance Management/Invoice');
+const Sale         = require('../../models/Finance Management/Sale');
+const Receivable   = require('../../models/Finance Management/Receivable');
+const Dispatch     = require('../../models/Marketplace Management/Dispatch');
+const Company      = require('../../models/Company Management/Company');
+const User         = require('../../models/User Management/User');
+const Inventory    = require('../../models/Purchase & Inventory Management/Inventory');
+const StockMovement = require('../../models/Purchase & Inventory Management/StockMovement');
+const Employee     = require('../../models/HR Management/Employee');
+const { deductStockForOrder, restoreStockForOrder, reserveStockForOrder, releaseReserveForOrder, checkAndNotifyStockLevels } = require('../Purchase & Inventory Management/inventoryController');
+const { notifyRetailer } = require('../../utils/pushHelper');
+
+const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
+
+// ── Sale/Receivable code helpers ─────────────────────────────────────────────
+async function nextSaleCode() {
+  const last = await Sale.findOne({ sale_code: /^SAL-/ }).sort({ sale_code: -1 }).lean();
+  const num  = last?.sale_code ? parseInt(last.sale_code.split('-')[1], 10) : 0;
+  return `SAL-${String(num + 1).padStart(4, '0')}`;
+}
+async function nextRcvCode() {
+  const last = await Receivable.findOne({ rcv_code: /^RCV-/ }).sort({ rcv_code: -1 }).lean();
+  const num  = last?.rcv_code ? parseInt(last.rcv_code.split('-')[1], 10) : 0;
+  return `RCV-${String(num + 1).padStart(4, '0')}`;
+}
+
+// ─── Unified 6-stage order lifecycle ────────────────────────────────────────
+// New → Accepted → Packing → Dispatched → Out for Delivery → Delivered
+// ─────────────────────────────────────────────────────────────────────────────
+const ORDER_STATUSES = [
+  'New',
+  'Accepted',
+  'Packing',
+  'Dispatched',
+  'Out for Delivery',
+  'Delivered',
+  'Cancelled',
+];
+
+const VALID_TRANSITIONS = {
+  'New':             ['Accepted',   'Cancelled'],
+  'Accepted':        ['Packing',    'Cancelled'],
+  'Packing':         ['Dispatched', 'Cancelled'],
+  'Dispatched':      ['Out for Delivery'],
+  'Out for Delivery':['Delivered'],
+  'Delivered':       [],
+  'Cancelled':       [],
+};
+
+const ORDER_MANAGERS = ['Wholesaler', 'Manager', 'Company Owner', 'Super Admin', 'Sales Executive', 'Warehouse Staff', 'Accountant'];
+
+/** GET /api/orders  AND  GET /api/staff/orders */
+// Build a loose phone matcher: matches records whose stored phone contains the
+// customer's last 10 digits, so "+91 98765 43212" and "9876543212" both match.
+function phoneRegexFromMobile(mobile) {
+  const digits = String(mobile || '').replace(/\D/g, '');
+  if (digits.length < 10) return null;
+  const last10 = digits.slice(-10);
+  return new RegExp(last10.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+}
+
+async function listOrders(req, res) {
+  const { status, search, customer_id, customer_mobile, page = 1, limit = 100 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+
+  const query = { company_id: req.user.company_id };
+
+  // A customer's orders may be linked several ways depending on origin:
+  //   - customer_id        → staff/admin-created orders for a CRM customer
+  //   - buyer_company_id   → orders from a retailer/marketplace enquiry
+  //   - customer_mobile    → retailer/marketplace orders store the phone here
+  // The customer-detail screen wants the FULL history, so match any of them.
+  // We resolve the authoritative mobile from the Customer record (so formatting
+  // differences on the client don't cause a miss) and also honour buyer_company_id.
+  const customerOr = [];
+  let resolvedMobile = customer_mobile;
+  if (customer_id) {
+    customerOr.push({ customer_id }, { buyer_company_id: customer_id });
+    try {
+      const Customer = require('../../models/CRM Management/Customer');
+      const cust = await Customer.findOne(
+        { _id: customer_id, company_id: req.user.company_id },
+        { mobile: 1 }
+      ).lean();
+      if (cust?.mobile) resolvedMobile = cust.mobile;
+    } catch { /* fall back to the client-supplied mobile */ }
+  }
+  const phoneRx = phoneRegexFromMobile(resolvedMobile);
+  if (phoneRx) {
+    customerOr.push({ customer_mobile: phoneRx });
+  }
+  const customerMatch = customerOr.length ? customerOr : null;
+
+  if (customerMatch) {
+    console.log(`[Staff Orders] customer_id=${customer_id} mobile=${resolvedMobile} matchConditions=${customerOr.length}`);
+  }
+
+  // When called from the Staff App (/api/staff/orders), only return
+  // orders that are explicitly assigned to the logged-in staff user —
+  // UNLESS a customer_id is given (customer detail screen wants the FULL
+  // history for that customer, regardless of assignment).
+  if (req.isStaffApp && customerMatch) {
+    query.$or = customerMatch;
+  } else if (req.isStaffApp) {
+    query.assigned_to = req.user._id;
+  } else if (customerMatch) {
+    // Admin/CRM customer-scoped listing.
+    query.$or = customerMatch;
+  }
+
+  if (status && status !== 'All') query.status = status;
+
+  if (search) {
+    const searchOr = [
+      { customer_name: { $regex: search, $options: 'i' } },
+      { order_code:    { $regex: search, $options: 'i' } },
+      { product_name:  { $regex: search, $options: 'i' } },
+      { enquiry_code:  { $regex: search, $options: 'i' } },
+      { branch_name:   { $regex: search, $options: 'i' } },
+    ];
+    // Combine the existing restrictions (staff assignment and/or the
+    // customer match) with the search using $and so no filter is dropped.
+    const andClauses = [];
+    if (query.assigned_to) {
+      andClauses.push({ assigned_to: query.assigned_to });
+      delete query.assigned_to;
+    }
+    if (query.$or) {
+      andClauses.push({ $or: query.$or });
+      delete query.$or;
+    }
+    andClauses.push({ $or: searchOr });
+    query.$and = andClauses;
+  }
+
+  const [total, orders] = await Promise.all([
+    Order.countDocuments(query),
+    Order.find(query).sort({ created_at: -1 }).skip(offset).limit(parseInt(limit)).lean(),
+  ]);
+  if (customer_id || customer_mobile) {
+    console.log(`[Staff Orders] returning ${orders.length}/${total} order(s) for customer_id=${customer_id}`);
+  }
+  sendSuccess(res, { orders, pagination: paginate(total, parseInt(page), parseInt(limit)) });
+}
+
+/** GET /api/orders/transitions */
+async function getTransitions(req, res) {
+  sendSuccess(res, { statuses: ORDER_STATUSES, transitions: VALID_TRANSITIONS });
+}
+
+/** GET /api/orders/:id  (enriched for Staff App) */
+async function getOrder(req, res) {
+  const param = req.params.id;
+  // Staff App passes order_code (e.g. ORD-2026-000782); admin passes MongoDB _id.
+  // Support both: try order_code first, then fall back to _id.
+  const mongoose = require('mongoose');
+  const isObjectId = mongoose.Types.ObjectId.isValid(param) && String(new mongoose.Types.ObjectId(param)) === param;
+  const query = isObjectId
+    ? { _id: param,          company_id: req.user.company_id }
+    : { order_code: param,   company_id: req.user.company_id };
+
+  const order = await Order.findOne(query)
+    .populate('assigned_to', 'name mobile email designation')
+    .lean();
+  if (!order) return sendError(res, 'Order not found.', 404);
+
+  // For the Staff App, attach all linked dispatches and invoices so the
+  // detail screen can render a complete picture without extra round-trips.
+  if (req.isStaffApp) {
+    const [dispatches, invoices] = await Promise.all([
+      Dispatch.find({ order_id: order._id, company_id: req.user.company_id })
+        .sort({ created_at: 1 })
+        .lean(),
+      Invoice.find({ order_id: order._id, company_id: req.user.company_id })
+        .sort({ created_at: 1 })
+        .lean(),
+    ]);
+
+    // Compute payment summary from invoices
+    const totalInvoiced = invoices.reduce((s, inv) => s + (inv.grand_total || 0), 0);
+    const totalPaid     = invoices.reduce((s, inv) => s + (inv.paid_amount  || 0), 0);
+    const totalBalance  = invoices.reduce((s, inv) => s + (inv.balance_due  != null ? inv.balance_due : (inv.grand_total || 0) - (inv.paid_amount || 0)), 0);
+
+    return sendSuccess(res, {
+      ...order,
+      _dispatches:     dispatches,
+      _invoices:       invoices,
+      _payment_summary: {
+        total_invoiced: totalInvoiced,
+        total_paid:     totalPaid,
+        total_balance:  totalBalance,
+        invoice_count:  invoices.length,
+      },
+    });
+  }
+
+  sendSuccess(res, order);
+}
+
+/** GET /api/orders/:id/next-statuses */
+async function getNextStatuses(req, res) {
+  const order = await Order.findOne({ _id: req.params.id, company_id: req.user.company_id }).lean();
+  if (!order) return sendError(res, 'Order not found.', 404);
+  sendSuccess(res, {
+    current: order.status,
+    next:    VALID_TRANSITIONS[order.status] || [],
+  });
+}
+
+/** POST /api/orders/from-enquiry — idempotent */
+async function createOrderFromEnquiry(req, res) {
+  const { enquiry_id } = req.body;
+  if (!enquiry_id) return sendError(res, 'enquiry_id is required.');
+
+  const existing = await Order.findOne({ enquiry_id }).select('_id order_code status').lean();
+  if (existing) return sendSuccess(res, existing, 'Order already exists for this enquiry.', 200);
+
+  const enquiry = await Enquiry.findOne({ _id: enquiry_id, company_id: req.user.company_id }).lean();
+  if (!enquiry) return sendError(res, 'Enquiry not found.', 404);
+  if (enquiry.buyer_company_id) {
+    return sendError(res, 'Retailer marketplace orders must be created by the buyer from an accepted offer.', 409);
+  }
+  if (enquiry.status !== 'Confirmed')
+    return sendError(res, 'Enquiry must be Confirmed before creating an order.');
+
+  const rate        = parseFloat(req.body.rate || enquiry.offered_price || 0);
+  const qty         = parseFloat(enquiry.qty || 1);
+  const gst_pct     = parseFloat(req.body.gst_percent || 18);
+  const amount      = qty * rate;
+  const gst_amount  = Math.round(amount * gst_pct / 100);
+  const total_amount= amount + gst_amount;
+
+  // Auto-generate order_code
+  const year   = new Date().getFullYear();
+  const prefix = `ORD-${year}-`;
+  const last   = await Order.findOne({ order_code: { $regex: `^${prefix}` } }).sort({ order_code: -1 }).lean();
+  const parts  = last?.order_code?.split('-') || [];
+  const num    = parseInt(parts[parts.length - 1] || 0, 10);
+  const order_code = `${prefix}${String(num + 1).padStart(6, '0')}`;
+
+  const order = await Order.create({
+    order_code,
+    company_id:       req.user.company_id,
+    enquiry_id:       enquiry._id,
+    enquiry_code:     enquiry.enq_code || '',
+    customer_name:    enquiry.retailer_name,
+    customer_mobile:  enquiry.retailer_mobile || '',
+    customer_email:   enquiry.retailer_email  || '',
+    delivery_address: req.body.delivery_address || enquiry.location || '',
+    location:         enquiry.location || '',
+    product_id:       enquiry.product_id   || null,
+    product_code:     enquiry.product_code || '',
+    product_name:     enquiry.product_name || '',
+    unit:             enquiry.unit         || 'Pcs',
+    qty, rate,
+    amount, gst_percent: gst_pct, gst_amount, total_amount,
+    branch_id:        req.body.branch_id   || null,
+    branch_name:      req.body.branch_name || '',
+    notes:            req.body.notes       || enquiry.remarks || '',
+    created_by:       req.user._id,
+    created_by_name:  req.user.name || '',
+    status:           'New',
+    order_date:       new Date(),
+    // Auto-assign to the staff member who created the order via Staff App
+    ...(req.isStaffApp ? {
+      assigned_to:      req.user._id,
+      assigned_to_name: req.user.name || '',
+      assigned_date:    new Date(),
+      assignment_type:  'AUTO',
+    } : {}),
+    status_history: [{
+      status:          'New',
+      updated_by_name: req.user.name || 'System',
+      remarks:         'Order created from enquiry',
+      timestamp:       new Date(),
+    }],
+  });
+
+  // Link order back to enquiry
+  await Enquiry.findOneAndUpdate(
+    { _id: enquiry_id, company_id: req.user.company_id },
+    { order_id: order._id }
+  );
+
+  await Notification.create({
+    company_id:   req.user.company_id,
+    type:         'order',
+    title:        `Order ${order_code} Created`,
+    message:      `Order for ${order.customer_name} from ${enquiry.enq_code} — ₹${total_amount.toLocaleString('en-IN')}`,
+    reference_id: order._id,
+  });
+
+  // NOTE: Stock is no longer deducted at order creation (booking).
+  // Per workflow: Available → Reserved happens at "Order Accepted" (updateOrderStatus).
+  // Legacy orders kept backward-compatible via stock_deducted flag (still false here).
+  // const deductedFromEnq = await deductStockForOrder(order, req.user._id);
+  // if (deductedFromEnq) await Order.findByIdAndUpdate(order._id, { stock_deducted: true });
+
+  sendSuccess(res, order, 'Order created.', 201);
+}
+
+/** POST /api/orders */
+async function createOrder(req, res) {
+  if (!ORDER_MANAGERS.includes(req.user?.role)) {
+    return sendError(res, 'Access denied.', 403);
+  }
+
+  const { customer_name, qty, rate } = req.body;
+  if (!customer_name || !qty || !rate)
+    return sendError(res, 'customer_name, qty and rate are required.');
+
+  // Duplicate guard
+  if (req.body.enquiry_id) {
+    const existing = await Order.findOne({ enquiry_id: req.body.enquiry_id }).select('_id order_code status').lean();
+    if (existing) return sendSuccess(res, existing, 'Order already exists for this enquiry.', 200);
+  }
+
+  const gst_pct      = parseFloat(req.body.gst_percent   || 18);
+  const purchase_rate = parseFloat(req.body.purchase_rate || 0);
+  const amount        = parseFloat(qty) * parseFloat(rate);
+  const gst_amount    = Math.round(amount * gst_pct / 100);
+  const total_amount  = amount + gst_amount;
+  const purchase_cost = parseFloat(qty) * purchase_rate;
+
+  const year   = new Date().getFullYear();
+  const prefix = `ORD-${year}-`;
+  const last   = await Order.findOne({ order_code: { $regex: `^${prefix}` } }).sort({ order_code: -1 }).lean();
+  const parts  = last?.order_code?.split('-') || [];
+  const num    = parseInt(parts[parts.length - 1] || 0, 10);
+  const order_code = `${prefix}${String(num + 1).padStart(6, '0')}`;
+
+  // Resolve enquiry_code if not supplied
+  let enquiry_code = req.body.enquiry_code || '';
+  if (req.body.enquiry_id && !enquiry_code) {
+    const enq = await Enquiry.findOne({ _id: req.body.enquiry_id, company_id: req.user.company_id }).lean();
+    if (enq) enquiry_code = enq.enq_code || '';
+  }
+
+  const order = await Order.create({
+    ...req.body,
+    order_code,
+    enquiry_code,
+    company_id:      req.user.company_id,
+    buyer_company_id: null,
+    buyer_user_id:    null,
+    seller_company_id:null,
+    offer_id:         null,
+    amount, gst_amount, total_amount,
+    gst_percent:     gst_pct,
+    purchase_cost,
+    status:          'New',
+    order_date:      new Date(),
+    created_by:      req.user._id,
+    created_by_name: req.user.name || '',
+    // Auto-assign to the staff member who created the order via Staff App
+    ...(req.isStaffApp ? {
+      assigned_to:      req.user._id,
+      assigned_to_name: req.user.name || '',
+      assigned_date:    new Date(),
+      assignment_type:  'AUTO',
+    } : {}),
+    status_history: [{
+      status:          'New',
+      updated_by_name: req.user.name || 'System',
+      remarks:         'Order created',
+      timestamp:       new Date(),
+    }],
+  });
+
+  if (req.body.enquiry_id) {
+    await Enquiry.findOneAndUpdate(
+      { _id: req.body.enquiry_id, company_id: req.user.company_id },
+      { order_id: order._id }
+    );
+  }
+
+  // NOTE: Stock is no longer deducted at order creation (booking).
+  // Per workflow: Available → Reserved happens at "Order Accepted" (updateOrderStatus).
+  // Legacy orders kept backward-compatible via stock_deducted flag (still false here).
+  // const deducted = await deductStockForOrder(order, req.user._id);
+  // if (deducted) await Order.findByIdAndUpdate(order._id, { stock_deducted: true });
+
+  await Notification.create({
+    company_id:   req.user.company_id,
+    type:         'order',
+    title:        `Order ${order_code} Created`,
+    message:      `Order for ${customer_name} — ₹${total_amount.toLocaleString('en-IN')}`,
+    reference_id: order._id,
+  });
+
+  sendSuccess(res, order, 'Order created.', 201);
+}
+
+/** PATCH /api/orders/:id/status */
+async function updateOrderStatus(req, res) {
+  const { status, remarks } = req.body;
+  if (!status) return sendError(res, 'status is required.');
+  if (!ORDER_STATUSES.includes(status)) return sendError(res, `Invalid status: ${status}`);
+
+  const order = await Order.findOne({ _id: req.params.id, company_id: req.user.company_id }).lean();
+  if (!order) return sendError(res, 'Order not found.', 404);
+
+  const allowed = VALID_TRANSITIONS[order.status] || [];
+  if (!allowed.includes(status)) {
+    return sendError(res, `Cannot transition from "${order.status}" to "${status}". Allowed: ${allowed.join(', ') || 'none'}`, 422);
+  }
+
+  // ── Reserve stock BEFORE accepting an order ─────────────────────────────
+  // Workflow Decision Point #1: Available → Reserved = on Order Accepted.
+  // Policy: acceptance is NO LONGER blocked when stock is missing/insufficient.
+  // We still reserve whatever stock exists; if reservation can't be done, we
+  // accept the order anyway and record a note so it's visible in the history.
+  let reserveResult = null;
+  let reserveWarning = '';
+  if (order.status === 'New' && status === 'Accepted') {
+    reserveResult = await reserveStockForOrder({
+      companyId:   req.user.company_id,
+      productId:   order.product_id,
+      warehouseId: order.warehouse_id || null,
+      qty:         order.qty,
+      orderId:     order._id,
+      orderCode:   order.order_code,
+      userId:      req.user._id,
+    });
+    if (!reserveResult.ok) {
+      // Non-blocking: proceed with acceptance, but flag that stock wasn't reserved.
+      reserveWarning = reserveResult.error || 'stock not reserved';
+      console.warn(`[updateOrderStatus] accepting order ${order.order_code} without reservation — ${reserveWarning}`);
+    }
+  }
+
+  const STAGE_REMARKS = {
+    'Accepted':        'Order accepted',
+    'Packing':         'Packing started',
+    'Dispatched':      'Order dispatched',
+    'Out for Delivery':'Out for delivery',
+    'Delivered':       'Delivered',
+    'Cancelled':       'Order cancelled',
+  };
+
+  const baseRemark = remarks || STAGE_REMARKS[status] || '';
+  const histEntry = {
+    status,
+    updated_by:      req.user._id,
+    updated_by_name: req.user.name || '',
+    updated_by_role: req.user.role || '',
+    remarks:         reserveWarning
+      ? `${baseRemark} (stock not reserved — ${reserveWarning})`.trim()
+      : baseRemark,
+    timestamp:       new Date(),
+  };
+
+  // Guard: skip pushing a duplicate if the last history entry already has this status
+  const lastEntry = order.status_history?.slice(-1)[0];
+  const histUpdate = (lastEntry && lastEntry.status === status)
+    ? { status }
+    : { status, $push: { status_history: histEntry } };
+  // Record whether stock was actually reserved on this Accept, so the cancel
+  // flow knows if there is a reservation to release.
+  if (order.status === 'New' && status === 'Accepted') {
+    histUpdate.stock_reserved = !!(reserveResult && reserveResult.ok);
+  }
+
+  let updated = await Order.findOneAndUpdate(
+    { _id: req.params.id, company_id: req.user.company_id },
+    histUpdate,
+    { new: true }
+  ).lean();
+
+  // Cancelling a booked order returns its quantity to inventory.
+  if (status === 'Cancelled') {
+    // Legacy path: stock was already deducted at booking (direct physical/available deduct).
+    if (order.stock_deducted) {
+      const restored = await restoreStockForOrder(order, req.user._id, req.user.company_id);
+      if (restored) {
+        await Order.findByIdAndUpdate(req.params.id, { stock_deducted: false });
+        if (updated) updated.stock_deducted = false;
+      }
+    } else if (order.stock_reserved) {
+      // New reserve-bucket path (Decision Point #1): stock was moved to reserved
+      // at Accepted. Only release when a reservation actually happened — orders
+      // accepted without stock have stock_reserved=false and nothing to release.
+      const released = await releaseReserveForOrder({
+        companyId:   req.user.company_id,
+        productId:   order.product_id,
+        warehouseId: order.warehouse_id || null,
+        qty:         order.qty,
+        orderId:     order._id,
+        orderCode:   order.order_code,
+        userId:      req.user._id,
+      });
+      // Non-fatal: log but don't fail the cancel.
+      if (!released.ok) console.warn('[updateOrderStatus] release on cancel failed:', released.error);
+      else {
+        await Order.findByIdAndUpdate(req.params.id, { stock_reserved: false });
+        if (updated) updated.stock_reserved = false;
+      }
+    }
+  }
+
+  // Auto-generate invoice number when moving to Invoice Generated
+  if (status === 'Invoice Generated' && updated) {
+    const invYear   = new Date().getFullYear();
+    const invPrefix = `INV-${invYear}-`;
+    const lastInv   = await Order.findOne({ company_id: req.user.company_id, invoice_number: { $regex: `^${invPrefix}` } })
+      .sort({ invoice_number: -1 }).lean();
+    const invParts  = lastInv?.invoice_number?.split('-') || [];
+    const invNum    = parseInt(invParts[invParts.length - 1] || 0, 10);
+    const invoice_number = `${invPrefix}${String(invNum + 1).padStart(6, '0')}`;
+    updated = await Order.findByIdAndUpdate(
+      req.params.id,
+      { invoice_number, invoice_date: new Date() },
+      { new: true }
+    ).lean();
+  }
+
+  const notifications = [Notification.create({
+    company_id:   req.user.company_id,
+    type:         'order',
+    title:        `Order → ${status}`,
+    message:      `Order ${updated.order_code} status updated to ${status} by ${req.user.name || 'user'}`,
+    reference_id: updated._id,
+  })];
+  if (updated.buyer_company_id && updated.buyer_user_id) {
+    notifications.push(Notification.create({
+      company_id: updated.buyer_company_id,
+      user_id: updated.buyer_user_id,
+      type: 'order_status',
+      title: `Order ${updated.order_code} updated`,
+      message: `Your order status is now ${status}.`,
+      reference_id: updated._id,
+    }));
+    // Push notification to retailer buyer
+    notifyRetailer(updated.buyer_user_id, {
+      title: `Order ${updated.order_code} Updated`,
+      body: `Your order status is now: ${status}`,
+      type: 'order_status',
+      referenceId: updated._id,
+    });
+  }
+  await Promise.all(notifications);
+
+  sendSuccess(res, updated, `Order status updated to ${status}.`);
+}
+
+/** PUT /api/orders/:id */
+async function updateOrder(req, res) {
+  const existingOrder = await Order.findOne({ _id: req.params.id, company_id: req.user.company_id })
+    .select('buyer_company_id')
+    .lean();
+  if (!existingOrder) return sendError(res, 'Order not found.', 404);
+  if (existingOrder.buyer_company_id) {
+    return sendError(res, 'Commercial fields on retailer marketplace orders are fixed by the accepted offer.', 409);
+  }
+
+  const {
+    customer_name, customer_mobile, customer_email, delivery_address, location,
+    qty, rate, gst_percent, transport_cost, packing_cost, due_date, notes, terms,
+    branch_id, branch_name, unit,
+  } = req.body;
+  const amount       = parseFloat(qty) * parseFloat(rate);
+  const gst_amount   = Math.round(amount * parseFloat(gst_percent || 18) / 100);
+  const total_amount = amount + gst_amount;
+
+  const order = await Order.findOneAndUpdate(
+    { _id: req.params.id, company_id: req.user.company_id },
+    {
+      customer_name, customer_mobile: customer_mobile || '',
+      customer_email:   customer_email   || '',
+      delivery_address: delivery_address || location || '',
+      location:         location         || '',
+      qty, rate, amount, gst_percent: gst_percent || 18, gst_amount, total_amount,
+      transport_cost: transport_cost || 0, packing_cost: packing_cost || 0,
+      due_date: due_date || null, notes: notes || '', terms: terms || '',
+      branch_id: branch_id || null, branch_name: branch_name || '',
+      unit: unit || 'Pcs',
+    },
+    { new: true }
+  ).lean();
+  if (!order) return sendError(res, 'Order not found.', 404);
+  sendSuccess(res, order, 'Order updated.');
+}
+
+/** DELETE /api/orders/:id */
+async function deleteOrder(req, res) {
+  const order = await Order.findOne({ _id: req.params.id, company_id: req.user.company_id })
+    .select('buyer_company_id')
+    .lean();
+  if (!order) return sendError(res, 'Order not found.', 404);
+  if (order.buyer_company_id) {
+    return sendError(res, 'Retailer marketplace orders cannot be hard-deleted.', 409);
+  }
+  await Order.deleteOne({ _id: order._id, company_id: req.user.company_id });
+  sendSuccess(res, null, 'Order deleted.');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Code generators for the partial-pack flow
+// ─────────────────────────────────────────────────────────────────────────────
+async function nextInvoiceNo(companyId) {
+  const last = await Invoice.findOne({ company_id: companyId, invoice_no: /^INV-/ })
+    .sort({ created_at: -1 }).select('invoice_no').lean();
+  const num = last?.invoice_no ? parseInt(String(last.invoice_no).split('-').pop(), 10) : 0;
+  return `INV-${String((num || 0) + 1).padStart(4, '0')}`;
+}
+
+async function nextDispatchCode() {
+  const last = await Dispatch.findOne({ dispatch_code: /^DIS-/ }).sort({ dispatch_code: -1 }).select('dispatch_code').lean();
+  const num = last?.dispatch_code ? parseInt(String(last.dispatch_code).split('-')[1], 10) : 0;
+  return `DIS-${String((num || 0) + 1).padStart(4, '0')}`;
+}
+
+/**
+ * POST /api/orders/:id/pack
+ * Partial packing: pack a slice of the order (pack_qty), create an Invoice + a
+ * Dispatch for exactly that quantity, update the order's packed/dispatched
+ * counters, and append a package record. Repeat until fully fulfilled.
+ *
+ * Body: { pack_qty, vehicle_number, driver_name, driver_mobile, transport_name,
+ *         lr_number, dispatch_date, expected_delivery_days, expected_delivery, branch_name }
+ */
+async function packOrder(req, res) {
+  const order = await Order.findOne({ _id: req.params.id, company_id: req.user.company_id });
+  if (!order) return sendError(res, 'Order not found.', 404);
+  if (['Cancelled'].includes(order.status)) return sendError(res, 'Cancelled orders cannot be packed.', 409);
+
+  const orderedQty     = Number(order.qty) || 0;
+  const alreadyShipped = Number(order.dispatched_qty) || 0;
+  const remaining      = round2(orderedQty - alreadyShipped);
+  if (remaining <= 0) return sendError(res, 'This order is already fully dispatched.', 409);
+
+  // Default to the full remaining quantity if none provided.
+  let packQty = req.body.pack_qty === undefined || req.body.pack_qty === '' ? remaining : Number(req.body.pack_qty);
+  if (!(packQty > 0)) return sendError(res, 'pack_qty must be greater than zero.', 400);
+  if (packQty > remaining) return sendError(res, `pack_qty cannot exceed the remaining quantity (${remaining}).`, 400);
+  packQty = round2(packQty);
+
+  const rate       = Number(order.rate) || 0;
+  const gstPercent = Number(order.gst_percent) || 0;
+  const amount     = round2(packQty * rate);
+  const gstAmount  = round2(amount * gstPercent / 100);
+  const total      = round2(amount + gstAmount);
+
+  const packNo = (order.packages?.length || 0) + 1;
+
+  // The admin/seller company that is issuing this invoice.
+  const sellerCompany = await Company.findById(req.user.company_id).select('name mobile email').lean().catch(() => null);
+
+  // Resolve the retailer (buyer) authoritatively from the order's buyer ids,
+  // so the invoice never mislabels the admin as the retailer.
+  let retailer = {
+    name: order.created_by_person || '',
+    company: order.created_by_company || '',
+    mobile: order.created_by_mobile || '',
+    email: order.created_by_email || '',
+  };
+  if (order.buyer_company_id) {
+    const [buyerCompany, buyerUser] = await Promise.all([
+      Company.findById(order.buyer_company_id).select('name mobile email').lean().catch(() => null),
+      order.buyer_user_id ? User.findById(order.buyer_user_id).select('name mobile email').lean().catch(() => null) : null,
+    ]);
+    if (buyerCompany || buyerUser) {
+      retailer = {
+        name: buyerUser?.name || retailer.name || buyerCompany?.name || '',
+        company: buyerCompany?.name || retailer.company || '',
+        mobile: buyerUser?.mobile || buyerCompany?.mobile || retailer.mobile || '',
+        email: buyerUser?.email || buyerCompany?.email || retailer.email || '',
+      };
+    }
+  }
+
+  // 1) Invoice for just this packed quantity
+  const invoice_no = await nextInvoiceNo(req.user.company_id);
+  const invoice = await Invoice.create({
+    company_id:     req.user.company_id,
+    invoice_no,
+    order_id:       order._id,
+    order_no:       order.order_code || '',
+    customer_id:    order.customer_id || null,
+    customer_name:  order.customer_name || '',
+    customer_phone: order.customer_mobile || '',
+    customer_email: order.customer_email || '',
+    billing_address:  order.delivery_address || order.location || '',
+    shipping_address: order.delivery_address || order.location || '',
+    invoice_date:   new Date(),
+    items: [{
+      product_id:   order.product_id || null,
+      product_name: order.product_name || '',
+      product_code: order.product_code || '',
+      unit:         order.unit || 'Box',
+      gst_percent:  gstPercent,
+      qty:          packQty,
+      rate,
+      taxable_amount: amount,
+      gst_amount:   gstAmount,
+      total,
+    }],
+    subtotal:    amount,
+    gst_amount:  gstAmount,
+    grand_total: total,
+    balance_due: total,
+    payment_status: 'Unpaid',
+    status:      'sent',
+    // The Admin/seller who actually generated this invoice.
+    created_by_name:    req.user?.name || '',
+    created_by_person:  req.user?.name || '',
+    created_by_company: sellerCompany?.name || '',
+    created_by_mobile:  req.user?.mobile || sellerCompany?.mobile || '',
+    created_by_email:   req.user?.email || sellerCompany?.email || '',
+    created_by_type:    req.user?.role || 'Admin',
+    // The retailer this order was routed through (shown after Customer).
+    retailer_name:    retailer.name || '',
+    retailer_company: retailer.company || '',
+    retailer_mobile:  retailer.mobile || '',
+    retailer_email:   retailer.email || '',
+    remarks:     `Pack ${packNo} of order ${order.order_code} — ${packQty} ${order.unit || ''}`.trim(),
+    created_by:  req.user._id,
+  });
+
+  // 2) Dispatch for this packed quantity
+  const dispatch_code = await nextDispatchCode();
+  let expected_delivery = req.body.expected_delivery || null;
+  if (!expected_delivery && req.body.expected_delivery_days && req.body.dispatch_date) {
+    const d = new Date(req.body.dispatch_date);
+    d.setDate(d.getDate() + parseInt(req.body.expected_delivery_days, 10));
+    expected_delivery = d;
+  }
+  const dispatch = await Dispatch.create({
+    dispatch_code,
+    company_id:       req.user.company_id,
+    order_id:         order._id,
+    enquiry_code:     order.enquiry_code || '',
+    invoice_number:   invoice_no,
+    invoice_id:       invoice._id,
+    qty:              packQty,
+    unit:             order.unit || '',
+    customer_name:    order.customer_name || '',
+    branch_name:      req.body.branch_name || order.branch_name || '',
+    delivery_address: order.delivery_address || order.location || '',
+    vehicle_number:   req.body.vehicle_number || '',
+    driver_name:      req.body.driver_name || '',
+    driver_mobile:    req.body.driver_mobile || '',
+    transport_name:   req.body.transport_name || '',
+    lr_number:        req.body.lr_number || '',
+    dispatch_date:    req.body.dispatch_date || new Date(),
+    expected_delivery_days: req.body.expected_delivery_days ? parseInt(req.body.expected_delivery_days, 10) : null,
+    expected_delivery,
+    status:     'Dispatched',
+    created_by: req.user._id,
+  });
+
+  // 3a) STOCK OUT — deduct inventory for this packed quantity.
+  // Skip if stock was already deducted at booking (order creation) to avoid
+  // double-deduction; only the dispatched counter advances in that case.
+  if (order.product_id && packQty > 0 && !order.stock_deducted) {
+    try {
+      const invFilter = { company_id: req.user.company_id, product_id: order.product_id };
+      if (order.warehouse_id) invFilter.warehouse_id = order.warehouse_id;
+      const inv = await Inventory.findOne(invFilter);
+      if (inv) {
+        const fromPacked    = Math.min(packQty, inv.packed_stock    || 0);
+        const rem1          = packQty - fromPacked;
+        const fromPicking   = Math.min(rem1,   inv.picking_stock   || 0);
+        const rem2          = rem1 - fromPicking;
+        const fromReserved  = Math.min(rem2,   inv.reserved_stock  || 0);
+        const rem3          = rem2 - fromReserved;
+        const fromAvailable = Math.min(rem3,   inv.available_stock || 0);
+        const prevPhysical  = inv.physical_stock || 0;
+        await Inventory.findByIdAndUpdate(inv._id, {
+          $inc: {
+            packed_stock:    -fromPacked,
+            picking_stock:   -fromPicking,
+            reserved_stock:  -fromReserved,
+            available_stock: -fromAvailable,
+            physical_stock:  -packQty,
+            current_stock:   -packQty,
+            dispatched_qty:  +packQty,
+            stock_out:       +packQty,
+          },
+        });
+        await StockMovement.create({
+          company_id:     req.user.company_id,
+          product_id:     order.product_id,
+          product_name:   order.product_name || '',
+          product_code:   order.product_code || '',
+          warehouse_id:   order.warehouse_id || inv.warehouse_id || null,
+          movement_type:  'Stock Out',
+          quantity:       packQty,
+          previous_stock: prevPhysical,
+          new_stock:      prevPhysical - packQty,
+          unit:           order.unit || '',
+          reference_type: 'Sale',
+          reference_id:   dispatch._id?.toString() || '',
+          invoice_number: dispatch_code || '',
+          notes:          `Pack ${packNo} dispatched — ${dispatch_code} / Order ${order.order_code || ''}`,
+          created_by:     req.user._id,
+          movement_date:  new Date(),
+        }).catch(e => console.error('[StockMovement] packOrder log failed:', e.message));
+        // Threshold / out-of-stock notifications after dispatch stock-out
+        await checkAndNotifyStockLevels(
+          req.user.company_id, order.product_id,
+          inv.available_stock || 0, (inv.available_stock || 0) - fromAvailable,
+          inv.low_stock_alert || null
+        );
+      }
+    } catch (e) {
+      // Non-fatal — log and continue. Order dispatch must not fail due to inventory issues.
+      console.error('[packOrder] stock-out failed gracefully:', e.message);
+    }
+  }
+
+  // 3b) Update order counters + append package record + advance status
+  const newDispatched = round2(alreadyShipped + packQty);
+  const isFull = newDispatched >= orderedQty;
+  // Both full and partial dispatches move the order to 'Dispatched' (stage 4).
+  // Partial quantity is tracked via dispatched_qty vs qty — no need for a
+  // separate 'Partially Dispatched' status in the new 6-stage lifecycle.
+  const newStatus = 'Dispatched';
+
+  order.packed_qty     = round2((Number(order.packed_qty) || 0) + packQty);
+  order.dispatched_qty = newDispatched;
+  order.status         = newStatus;
+  order.dispatch_id    = dispatch._id;        // latest dispatch
+  order.invoice_number = invoice_no;          // latest invoice
+  order.invoice_date   = new Date();
+  // Save expected_delivery onto the order so the Staff App can display it
+  if (expected_delivery) order.expected_delivery = expected_delivery;
+  order.packages.push({
+    pack_no:        packNo,
+    qty:            packQty,
+    amount, gst_amount: gstAmount, total,
+    invoice_id:     invoice._id,
+    invoice_number: invoice_no,
+    dispatch_id:    dispatch._id,
+    dispatch_code,
+    vehicle_number: dispatch.vehicle_number,
+    transport_name: dispatch.transport_name,
+    lr_number:      dispatch.lr_number,
+    packed_by:      req.user._id,
+    packed_by_name: req.user.name || '',
+    packed_at:      new Date(),
+  });
+  order.status_history.push({
+    status: newStatus,
+    updated_by: req.user._id,
+    updated_by_name: req.user.name || '',
+    updated_by_role: req.user.role || '',
+    remarks: `Packed ${packQty} ${order.unit || ''} (pack ${packNo}) — invoice ${invoice_no}, dispatch ${dispatch_code}. Remaining ${round2(orderedQty - newDispatched)}.`.trim(),
+    timestamp: new Date(),
+  });
+  await order.save();
+
+  // 4a) Create a Sale record for this dispatch's quantity so Sales Management
+  // shows each partial fulfilment separately with the correct amount and
+  // links to the invoice. Idempotent: skip if a sale for this invoice already exists.
+  try {
+    const existingSale = await Sale.findOne({ invoice_number: invoice_no, company_id: req.user.company_id }).lean();
+    if (!existingSale) {
+      // COGS from inventory purchase rate.
+      let cogs = 0;
+      if (order.product_id) {
+        const invFilter = { company_id: req.user.company_id, product_id: order.product_id };
+        if (order.warehouse_id) invFilter.warehouse_id = order.warehouse_id;
+        const inv = await Inventory.findOne(invFilter).select('purchase_rate').lean();
+        cogs = round2((inv?.purchase_rate || 0) * packQty);
+      }
+
+      const sale = await Sale.create({
+        sale_code:       await nextSaleCode(),
+        company_id:      req.user.company_id,
+        order_id:        order._id,
+        order_code:      order.order_code || '',
+        dispatch_id:     dispatch._id,
+        dispatch_code,
+        invoice_number:  invoice_no,
+        invoice_date:    new Date(),
+        customer_id:     order.customer_id    || null,
+        customer_name:   order.customer_name  || '',
+        customer_mobile: order.customer_mobile || '',
+        product_id:      order.product_id     || null,
+        product_name:    order.product_name   || '',
+        product_code:    order.product_code   || '',
+        unit:            order.unit           || '',
+        qty:             packQty,
+        rate,
+        amount,
+        gst_percent:     gstPercent,
+        gst_amount:      gstAmount,
+        total_amount:    total,
+        grand_total:     total,
+        cogs,
+        outstanding:     total,     // nothing paid yet for this dispatch
+        paid_amount:     0,
+        payment_status:  'Pending',
+        sale_status:     'Confirmed',
+        sale_date:       new Date(),
+        created_by:      req.user._id,
+      });
+
+      // Create a matching Receivable so Payment Management shows this as
+      // outstanding and staff can collect against it.
+      await Receivable.create({
+        rcv_code:       await nextRcvCode(),
+        company_id:     req.user.company_id,
+        customer_id:    order.customer_id   || null,
+        customer_name:  order.customer_name || '',
+        order_id:       order._id,
+        sale_id:        sale._id,
+        invoice_id:     invoice._id,
+        invoice_amount: total,
+        received:       0,
+        outstanding:    total,
+        due_date:       null,
+        status:         'Pending',
+      });
+    }
+  } catch (e) {
+    // Non-fatal — log but don't block the response.
+    console.error('[packOrder] Sale/Receivable creation failed:', e.message);
+  }
+
+  // 4b) Notify buyer (retailer) if marketplace order
+  if (order.buyer_company_id) {
+    await Notification.create({
+      company_id: order.buyer_company_id,
+      user_id: order.buyer_user_id,
+      type: 'order_status',
+      title: `Order ${order.order_code} — ${packQty} ${order.unit || ''} dispatched`,
+      message: isFull
+        ? `Your full order has been dispatched. Invoice ${invoice_no}.`
+        : `${packQty} ${order.unit || ''} dispatched (${round2(orderedQty - newDispatched)} remaining). Invoice ${invoice_no}.`,
+      reference_id: order._id,
+    }).catch(() => {});
+    notifyRetailer(order.buyer_user_id, {
+      title: `Order ${order.order_code} Dispatched`,
+      body: isFull
+        ? `Your full order was dispatched. LR: ${dispatch.lr_number || '—'}`
+        : `${packQty} ${order.unit || ''} dispatched, ${round2(orderedQty - newDispatched)} remaining.`,
+      type: 'dispatch',
+      referenceId: order._id,
+    });
+  }
+
+  await Notification.create({
+    company_id: req.user.company_id,
+    type: 'dispatch',
+    title: `Pack ${packNo} dispatched — ${order.order_code}`,
+    message: `${packQty} ${order.unit || ''} packed & dispatched. Invoice ${invoice_no}, ${dispatch_code}.`,
+    reference_id: order._id,
+  }).catch(() => {});
+
+  const populated = await Order.findById(order._id).populate('dispatch_id').lean();
+  sendSuccess(res, { order: populated, invoice, dispatch }, isFull ? 'Order fully packed & dispatched.' : 'Partial pack dispatched.', 201);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/orders/:id/assign - Assign order to staff
+// ─────────────────────────────────────────────────────────────────────────────
+async function assignOrder(req, res) {
+  const { staff_id } = req.body;
+
+  if (!staff_id) {
+    return sendError(res, 'staff_id is required.');
+  }
+
+  // Normalise: if the client accidentally sends a populated object, extract _id.
+  const resolvedStaffId =
+    typeof staff_id === 'object' && staff_id !== null
+      ? String(staff_id._id || staff_id)
+      : String(staff_id);
+
+  const mongoose = require('mongoose');
+  if (!mongoose.Types.ObjectId.isValid(resolvedStaffId)) {
+    return sendError(res, 'Invalid staff_id format.', 400);
+  }
+
+  // The id may be either a User id (staff with a login) or an Employee id
+  // (HR staff without a login). Resolve both so assignment works for either.
+  //   - assignUserId: User._id used for notifications (null if no login)
+  //   - assignName:   display name shown on the order
+  let assignUserId = null;
+  let assignName   = '';
+
+  // 1. Try as a User in this company.
+  const staffUser = await User.findOne({
+    _id:        resolvedStaffId,
+    company_id: req.user.company_id,
+    is_active:  true,
+  }).select('name role').lean();
+
+  if (staffUser) {
+    assignUserId = resolvedStaffId;
+    assignName   = staffUser.name;
+  } else {
+    // 2. Try as an Employee in this company (staff = employee model).
+    const emp = await Employee.findOne({
+      _id:        resolvedStaffId,
+      company_id: req.user.company_id,
+    }).select('name user_id is_active').lean();
+
+    if (!emp || emp.is_active === false) {
+      return sendError(res, 'Staff member not found or does not belong to this company.', 404);
+    }
+    assignName   = emp.name;
+    // Use the employee's linked login (if any) as the notification target.
+    assignUserId = emp.user_id ? String(emp.user_id._id || emp.user_id) : null;
+  }
+
+  const order = await Order.findOneAndUpdate(
+    { _id: req.params.id, company_id: req.user.company_id },
+    {
+      assigned_to:      assignUserId,
+      assigned_to_name: assignName,
+      assigned_date:    new Date(),
+      assignment_type:  'MANUAL',
+    },
+    { new: true },
+  ).lean();
+
+  if (!order) {
+    return sendError(res, 'Order not found.', 404);
+  }
+
+  // Notify the assigned staff member only if they have a login account.
+  if (assignUserId) {
+    await Notification.create({
+      company_id:   req.user.company_id,
+      user_id:      assignUserId,
+      type:         'order',
+      title:        `Order ${order.order_code} Assigned`,
+      message:      `You have been assigned to order ${order.order_code} for ${order.customer_name}`,
+      reference_id: order._id,
+    }).catch(() => {});
+  }
+
+  sendSuccess(res, order, `Order assigned to ${assignName}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/orders/:id/claim - Staff claims unassigned order (self-assignment)
+// ─────────────────────────────────────────────────────────────────────────────
+async function claimOrder(req, res) {
+  // Staff can only claim unassigned orders
+  const order = await Order.findOne({ 
+    _id: req.params.id, 
+    company_id: req.user.company_id,
+    assigned_to: null  // Must be unassigned
+  });
+
+  if (!order) {
+    return sendError(res, 'Order not found or already assigned.', 404);
+  }
+
+  order.assigned_to = req.user._id;
+  order.assigned_to_name = req.user.name;
+  order.assigned_date = new Date();
+  order.assignment_type = 'CLAIMED';
+  await order.save();
+
+  sendSuccess(res, order, `Order ${order.order_code} claimed successfully!`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/orders/:id/invoice — generate a GST invoice from an order (idempotent)
+// ─────────────────────────────────────────────────────────────────────────────
+async function generateOrderInvoice(req, res) {
+  const order = await Order.findOne({ _id: req.params.id, company_id: req.user.company_id }).lean();
+  if (!order) return sendError(res, 'Order not found.', 404);
+  if (order.status === 'New') return sendError(res, 'Accept the order before generating an invoice.', 422);
+
+  // Idempotent — reuse an existing invoice for this order.
+  const existing = await Invoice.findOne({ company_id: req.user.company_id, order_id: order._id }).lean();
+  if (existing) return sendSuccess(res, existing, 'Invoice already exists for this order.', 200);
+
+  // Build line items from the order (multi-item or single-product order).
+  const srcItems = Array.isArray(order.items) && order.items.length
+    ? order.items
+    : [{
+        product_id: order.product_id || null, product_name: order.product_name || '',
+        product_code: order.product_code || '', unit: order.unit || 'Pcs',
+        qty: order.qty || 0, rate: order.rate || 0, gst_percent: order.gst_percent || 0,
+      }];
+
+  let subtotal = 0, gstTotal = 0;
+  const items = srcItems.map(it => {
+    const qty = Number(it.qty) || 0;
+    const rate = Number(it.rate) || 0;
+    const gstPct = Number(it.gst_percent ?? it.gst_rate ?? order.gst_percent ?? 0);
+    const amount = round2(qty * rate);
+    const gstAmt = round2(amount * gstPct / 100);
+    subtotal += amount; gstTotal += gstAmt;
+    return { product_id: it.product_id || null, product_name: it.product_name || '', product_code: it.product_code || '',
+             unit: it.unit || 'Pcs', qty, rate, gst_percent: gstPct, amount, gst_amount: gstAmt, total: round2(amount + gstAmt) };
+  });
+  const grand_total = round2(subtotal + gstTotal + (Number(order.transport_cost) || 0) + (Number(order.packing_cost) || 0) - (Number(order.discount) || 0));
+
+  const num = await Invoice.findOne({ company_id: req.user.company_id, invoice_no: /^INV-/ }, { invoice_no: 1 })
+    .sort({ created_at: -1 }).lean();
+  const seq = num?.invoice_no ? parseInt(num.invoice_no.split('-')[1], 10) : 0;
+  const invoice_no = `INV-${String(seq + 1).padStart(4, '0')}`;
+
+  const invoice = await Invoice.create({
+    company_id:     req.user.company_id,
+    invoice_no,
+    order_id:       order._id,
+    order_no:       order.order_code || '',
+    customer_id:    order.customer_id || null,
+    customer_name:  order.customer_name || '',
+    customer_phone: order.customer_mobile || '',
+    customer_email: order.customer_email || '',
+    invoice_date:   new Date(),
+    items,
+    subtotal:       round2(subtotal),
+    gst_amount:     round2(gstTotal),
+    transport_cost: Number(order.transport_cost) || 0,
+    packing_cost:   Number(order.packing_cost) || 0,
+    discount:       Number(order.discount) || 0,
+    grand_total,
+    status:         'Unpaid',
+    created_by:     req.user._id,
+  });
+
+  // Reflect on the order.
+  await Order.updateOne({ _id: order._id }, { invoice_id: invoice._id, invoice_no }).catch(() => {});
+
+  await Notification.create({
+    company_id:   req.user.company_id,
+    type:         'invoice',
+    title:        `Invoice ${invoice_no} generated`,
+    message:      `GST invoice for order ${order.order_code} — ₹${grand_total.toLocaleString('en-IN')}`,
+    reference_id: invoice._id,
+  }).catch(() => {});
+
+  sendSuccess(res, invoice, 'GST invoice generated.', 201);
+}
+
+module.exports = {
+  listOrders, getTransitions, getOrder, getNextStatuses,
+  createOrderFromEnquiry, createOrder,
+  updateOrderStatus, updateOrder, deleteOrder, packOrder,
+  assignOrder, claimOrder, generateOrderInvoice,
+};
